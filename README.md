@@ -5,23 +5,82 @@ A Rust shared library (`cdylib`) that embeds inside kdb+ via `2:` dynamic loadin
 ## Architecture
 
 ```
-┌─────────────────────────────┐              ┌─────────────────────────────┐
-│   q publisher process       │              │   q subscriber process      │
-│                             │              │                             │
-│   nats_connect[host; port]  │              │   nats_connect[host; port]  │
-│   nats_publish[subj; table] │              │   nats_subscribe[stream;    │
-│                             │              │     subj; name; policy;     │
-│                             │              │     `callback]              │
-│   ┌─────────────────────┐   │              │   ┌─────────────────────┐   │
-│   │  libkdb_plugin.so   │───────────────────▶  │  libkdb_plugin.so   │   │
-│   │  (Rust cdylib)      │  kdb+ IPC binary │   │  (Rust cdylib)      │   │
-│   └─────────────────────┘   │   :4222      │   └──────────┬──────────┘   │
-│                             │              │              │ sd1 pipe      │
-└─────────────────────────────┘              │   callback[decoded_K]        │
-                                             └─────────────────────────────┘
+┌─────────────────────────────┐    ┌──────────────────┐    ┌─────────────────────────────┐
+│   q publisher process       │    │   NATS Server    │    │   q subscriber process      │
+│                             │    │   (JetStream)    │    │                             │
+│   nats_connect[host; port]  │    │                  │    │   nats_connect[host; port]  │
+│   nats_publish[subj; table] │    │   :4222          │    │   nats_subscribe[stream;    │
+│                             │    │                  │    │     subj; name; policy;     │
+│   ┌─────────────────────┐   │    │  ┌────────────┐  │    │     `callback]              │
+│   │  libkdb_plugin.so   │───────>│  │  Stream /  │  │    │   ┌─────────────────────┐   │
+│   │  (Rust cdylib)      │   │    │  │  Consumer  │──────>│   │  libkdb_plugin.so   │   │
+│   └─────────────────────┘   │    │  └────────────┘  │    │   │  (Rust cdylib)      │   │
+│                             │    │                  │    │   └──────────┬──────────┘   │
+│    kdb+ IPC binary encode   │    │   persistence    │    │              │ sd1 pip      │
+│                             │    │   + replay       │    │   callback[decoded_K]       │
+└─────────────────────────────┘    └──────────────────┘    └─────────────────────────────┘
 ```
 
 Rust is loaded into q via `2:` (`dlopen`). There is no separate Rust process. The subscriber uses a background OS thread with a Unix pipe and q's `sd1` event-loop integration to deliver decoded messages back to q's main thread.
+
+### Publisher thread model
+
+All publish calls run on q's main thread. The shared tokio runtime executes async NATS I/O via `block_on`.
+
+```
+q main thread (single-threaded)
+│
+│  nats_publish[subj; data]
+│  ├── q_ipc_encode(3)            encode K → IPC bytes
+│  └── rt().block_on(...)         blocks until NATS I/O completes
+│       │
+│       ▼
+│  ┌─────────────────────────┐
+│  │  Shared tokio runtime   │   Runtime::new() defaults to 1 worker
+│  │  (multi-thread, lazy)   │   thread per CPU core. Only 1 is needed
+│  │                         │   here — block_on runs the future on the
+│  │  js.publish().await     │   calling thread; worker threads handle
+│  │  ack_future.await       │   background I/O polling only. Consider
+│  └─────────────────────────┘   worker_threads(1) or current_thread to
+|                                avoid spawning unnecessary OS threads.
+│
+│  nats_publish_async[subj; data]
+│  ├── q_ipc_encode(3)            encode K → IPC bytes
+│  ├── rt().block_on(publish)     send only — returns immediately
+│  └── ack future → PENDING_ACKS  queued, not awaited
+│
+│  nats_flush[(::)]
+│  └── rt().block_on(join_all)    await all queued acks in parallel
+│
+│  nats_publish_core[subj; data]
+│  ├── q_ipc_encode(3)            encode K → IPC bytes
+│  └── rt().block_on(publish)     fire-and-forget, no ack
+```
+
+### Subscriber thread model
+
+`nats_subscribe` spawns a dedicated OS thread with its own `current_thread` tokio runtime. Decoded messages are delivered to q's main thread via a Unix pipe and `sd1`.
+
+```
+q main thread                          Background consumer thread
+─────────────                          ──────────────────────────
+nats_subscribe[...]                    std::thread::spawn(...)
+├── pipe()  → (read_fd, write_fd)      │
+├── register_callback(read_fd, handler)│  Dedicated current_thread tokio runtime
+│                                      │  (single OS thread — K ptrs are safe)
+│                                      │
+│                                      │  loop:
+│   ┌──────────────────────────┐       │    msg = messages.next().await
+│   │  q event loop (sd1)      │       │    msg.ack().await
+│   │                          │       │    pin_symbol()
+│   │  nats_msg_handler(fd)    │ <───  |   q_ipc_decode(bytes) → K
+│   │  ├── read(fd) → K ptr    │ pipe  │    unpin_symbol()
+│   │  └── k(0, callback, K)   │       │    write(pipe, &K_ptr, 8)
+│   │      callback[decoded_K] │       │
+│   └──────────────────────────┘       │
+```
+
+Two separate tokio runtimes ensure publisher `block_on` calls and the subscriber's infinite loop never contend with each other.
 
 ### Rust-side IPC encode/decode
 
