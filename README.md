@@ -59,7 +59,7 @@ q main thread (single-threaded)
 
 ### Subscriber thread model
 
-`nats_subscribe` spawns a dedicated OS thread with its own `current_thread` tokio runtime. Decoded messages are delivered to q's main thread via a Unix pipe and `sd1`.
+`nats_subscribe` spawns a dedicated OS thread with its own `current_thread` tokio runtime. Decoded messages are delivered to q's main thread via a Unix pipe and `sd1`. The NATS message is **acked only after the q callback succeeds** (at-least-once delivery). On callback failure, the ack is skipped and the message is redelivered after the server's `ack_wait` timeout.
 
 ```
 q main thread                          Background consumer thread
@@ -71,12 +71,16 @@ nats_subscribe[...]                    std::thread::spawn(...)
 │                                      │
 │                                      │  loop:
 │   ┌──────────────────────────┐       │    msg = messages.next().await
-│   │  q event loop (sd1)      │       │    msg.ack().await
-│   │                          │       │    pin_symbol()
-│   │  nats_msg_handler(fd)    │ <───  |   q_ipc_decode(bytes) → K
-│   │  ├── read(fd) → K ptr    │ pipe  │    unpin_symbol()
-│   │  └── k(0, callback, K)   │       │    write(pipe, &K_ptr, 8)
-│   │      callback[decoded_K] │       │
+│   │  q event loop (sd1)      │       │    pin_symbol()
+│   │                          │       │    q_ipc_decode(bytes) → K
+│   │  nats_msg_handler(fd)    │ <───  │    unpin_symbol()
+│   │  ├── read(fd) → ptr      │ pipe  │    Box(PendingMsg{K, msg})
+│   │  ├── k(0, callback, K)   │       │    write(pipe, &ptr, 8)
+│   │  │   callback[decoded_K] │       │
+│   │  ├── on success:         │       │
+│   │  │   msg.ack().await     │       │  (ack deferred until callback succeeds)
+│   │  └── on error:           │       │
+│   │      skip ack → redeliver│       │
 │   └──────────────────────────┘       │
 ```
 
@@ -340,7 +344,7 @@ nats_flush[(::)]
 
 Attaches a durable pull consumer to the stream and spawns a background OS thread. **Returns immediately** — non-blocking for q.
 
-The callback receives the exact K type that was published (table, dict, atom, etc.). No manual deserialization needed.
+The callback receives the exact K type that was published (table, dict, atom, etc.). No manual deserialization needed. Messages use **at-least-once delivery** — the NATS ack is sent only after the callback succeeds. If the callback returns an error, the ack is skipped and the message is redelivered after the server's `ack_wait` timeout.
 
 #### Deliver policies
 
@@ -381,7 +385,7 @@ The subscriber always receives the **exact same K type** that was published. No 
 
 ## Subscriber Callback Mechanism
 
-The subscriber uses q's `sd1` event-loop registration (the "plumber pattern") to safely deliver messages from a background thread to q's main thread:
+The subscriber uses q's `sd1` event-loop registration (the "plumber pattern") to safely deliver messages from a background thread to q's main thread. The NATS message handle is bundled with the decoded K value in a `PendingMsg` struct so the ack can be deferred until the callback succeeds:
 
 ```
 Background consumer thread              q main thread
@@ -390,13 +394,16 @@ NATS message arrives
   pin_symbol()                       ←── register_callback(read_fd, handler)
   q_ipc_decode(bytes) → K                watches read_fd via q event loop
   unpin_symbol()
-  write(pipe_write_fd, &k_ptr, 8) ─────► nats_msg_handler(read_fd)
-                                          read(read_fd, &k_ptr, 8)
-                                          k(0, "callback", k_ptr, KNULL)
-                                          callback[decoded_K] fires in q
+  Box(PendingMsg{decoded_K, msg})
+  write(pipe_write_fd, &ptr, 8)  ──────► nats_msg_handler(read_fd)
+                                          read(read_fd, &ptr, 8)
+                                          Box::from_raw(ptr) → PendingMsg
+                                          k(0, "callback", decoded_K, KNULL)
+                                          callback succeeds → msg.ack()
+                                          callback fails    → skip ack (redeliver)
 ```
 
-`pin_symbol()` / `unpin_symbol()` lock q's symbol intern table so symbols can be safely created from the background thread.
+`pin_symbol()` / `unpin_symbol()` lock q's symbol intern table so symbols can be safely created from the background thread. The deferred ack pattern provides **at-least-once delivery** — if the q callback errors or the process crashes before acking, the NATS server redelivers the message after the `ack_wait` timeout.
 
 ---
 
