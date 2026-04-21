@@ -1,2 +1,360 @@
 # nats-rust-kdbx
-NATs kdbx plugin using rust
+
+A Rust shared library (`cdylib`) that embeds inside kdb+ via `2:` dynamic loading, providing native NATS JetStream and core NATS publish/subscribe for q processes. Serialisation uses kdb+ IPC binary — no JSON, no type loss.
+
+## Architecture
+
+```
+┌─────────────────────────────┐              ┌─────────────────────────────┐
+│   q publisher process       │              │   q subscriber process      │
+│                             │              │                             │
+│   nats_connect[host; port]  │              │   nats_connect[host; port]  │
+│   nats_publish[subj; table] │              │   nats_subscribe[stream;    │
+│                             │              │     subj; name; policy;     │
+│                             │              │     `callback]              │
+│   ┌─────────────────────┐   │              │   ┌─────────────────────┐   │
+│   │  libkdb_plugin.so   │───────────────────▶  │  libkdb_plugin.so   │   │
+│   │  (Rust cdylib)      │  kdb+ IPC binary │   │  (Rust cdylib)      │   │
+│   └─────────────────────┘   │   :4222      │   └──────────┬──────────┘   │
+│                             │              │              │ sd1 pipe      │
+└─────────────────────────────┘              │   callback[decoded_K]        │
+                                             └─────────────────────────────┘
+```
+
+Rust is loaded into q via `2:` (`dlopen`). There is no separate Rust process. The subscriber uses a background OS thread with a Unix pipe and q's `sd1` event-loop integration to deliver decoded messages back to q's main thread.
+
+---
+
+## Build
+
+### Prerequisites
+
+- Rust toolchain (1.70+)
+- `pkg-config` and `libssl-dev` (Ubuntu/Debian)
+- kdb+ (q binary) for running the plugin
+
+### Local build
+
+```bash
+sudo apt-get install -y pkg-config libssl-dev
+
+cargo build --lib --release
+# produces: target/release/libkdb_plugin.so
+```
+
+### Docker build
+
+```bash
+docker build -f Dockerfile.rust -t nats-kdb-rust .
+```
+
+The `Dockerfile.rust` is a multi-stage build:
+1. **Builder** (`rust:1.88-slim`): compiles the cdylib
+2. **Runtime** (`ubuntu:22.04`): copies just `libkdb_plugin.so`
+
+Mount your q installation at runtime:
+```yaml
+volumes:
+  - ${QHOME}:/q:ro
+```
+
+---
+
+## Quick Start
+
+```bash
+# Start NATS JetStream
+cd examples
+docker compose up -d
+
+# Terminal 1 — subscriber (start first)
+q examples/subscriber.q -p 5010
+
+# Terminal 2 — publisher
+q examples/publisher_sync.q
+```
+
+---
+
+## Loading the Plugin in q
+
+```q
+PLUGIN: `./target/release/libkdb_plugin    / path to .so (no extension needed)
+
+nats_connect:        PLUGIN 2: (`nats_connect;        2)
+jetstream_init:      PLUGIN 2: (`jetstream_init;      2)
+nats_publish:        PLUGIN 2: (`nats_publish;        2)
+nats_publish_core:   PLUGIN 2: (`nats_publish_core;   2)
+nats_publish_noack:  PLUGIN 2: (`nats_publish_noack;  2)
+nats_publish_async:  PLUGIN 2: (`nats_publish_async;  2)
+nats_set_flush_size: PLUGIN 2: (`nats_set_flush_size; 1)
+nats_flush:          PLUGIN 2: (`nats_flush;           1)
+nats_subscribe:      PLUGIN 2: (`nats_subscribe;      5)
+```
+
+`2:` calls `dlopen` on the path, resolves each symbol by name, and wraps it as a q function. The Rust function must be `#[no_mangle] extern "C"` and compiled as `crate-type = ["cdylib"]`.
+
+---
+
+## API Reference
+
+### `nats_connect[host; port]` — required
+
+| Arg | Type | Description |
+|-----|------|-------------|
+| `host` | symbol | NATS server hostname, e.g. `` `localhost `` |
+| `port` | int | NATS server port, e.g. `4222i` |
+
+Establishes the NATS TCP connection and caches it for the process lifetime. All other APIs share this connection. Subsequent calls are silently ignored.
+
+**Must be called before any other API.**
+
+```q
+nats_connect[`localhost; 4222i]
+nats_connect[`my-nats-server; 4222i]
+```
+
+---
+
+### `jetstream_init[stream_name; subject]` — optional
+
+| Arg | Type | Description |
+|-----|------|-------------|
+| `stream_name` | symbol | JetStream stream name, e.g. `` `TRADES `` |
+| `subject` | symbol | Subject pattern, e.g. `` `trades.tick `` |
+
+Creates the JetStream stream if it does not already exist. Uses `get_or_create_stream` — fully idempotent. Skip this call if the stream is pre-configured on the server.
+
+```q
+jetstream_init[`TRADES; `trades.tick]
+```
+
+---
+
+### `nats_publish[subject; payload]` — JetStream sync ack
+
+| Arg | Type | Description |
+|-----|------|-------------|
+| `subject` | symbol | NATS subject, e.g. `` `trades.tick `` |
+| `payload` | K | Any kdb+ object (table, dict, list, atom) |
+
+Encodes the K object as kdb+ IPC binary via `q_ipc_encode(3)`, publishes to JetStream, and **blocks until the server acknowledges** persistence. One round-trip per message.
+
+```q
+nats_publish[`trades.tick; trades]         / table
+nats_publish[`trades.tick; last trades]    / dict (single row)
+nats_publish[`trades.tick; 42j]            / atom
+```
+
+**Requires:** `nats_connect`, `jetstream_init`
+
+---
+
+### `nats_publish_core[subject; payload]` — core NATS fire-and-forget
+
+| Arg | Type | Description |
+|-----|------|-------------|
+| `subject` | symbol | NATS subject |
+| `payload` | K | Any kdb+ object |
+
+Publishes via core NATS (no JetStream). Fire-and-forget — returns immediately, no persistence guarantee. If a JetStream stream is configured to capture the subject, messages are still persisted server-side.
+
+```q
+nats_publish_core[`trades.tick; trades]
+```
+
+**Requires:** `nats_connect`
+
+---
+
+### `nats_publish_noack[subject; payload]` — JetStream no-ack
+
+| Arg | Type | Description |
+|-----|------|-------------|
+| `subject` | symbol | NATS subject |
+| `payload` | K | Any kdb+ object |
+
+Publishes to JetStream but **drops the ack future** immediately. The message is persisted by the server, but the publisher does not wait for confirmation.
+
+```q
+nats_publish_noack[`trades.tick; trades]
+```
+
+**Requires:** `nats_connect`, `jetstream_init`
+
+---
+
+### `nats_publish_async[subject; payload]` — JetStream pipelined
+
+| Arg | Type | Description |
+|-----|------|-------------|
+| `subject` | symbol | NATS subject |
+| `payload` | K | Any kdb+ object |
+
+Publishes to JetStream and **queues the ack future** for later collection. Returns immediately — no per-message blocking. Call `nats_flush` after the publish loop to await all queued acks in parallel.
+
+If `nats_set_flush_size` was called with N > 0, auto-flushes every N queued messages.
+
+```q
+do[1000; nats_publish_async[`trades.tick; genTrade 10]];
+nats_flush[(::)]
+```
+
+**Requires:** `nats_connect`, `jetstream_init`
+
+---
+
+### `nats_set_flush_size[n]` — auto-flush threshold
+
+| Arg | Type | Description |
+|-----|------|-------------|
+| `n` | int/long | Flush every N queued acks. 0 = disabled (default). |
+
+When N > 0, `nats_publish_async` automatically flushes after every N queued ack futures. Set to 0 to disable auto-flush and rely on manual `nats_flush` calls.
+
+```q
+nats_set_flush_size[1000]   / auto-flush every 1000 messages
+nats_set_flush_size[0]      / disable auto-flush
+```
+
+---
+
+### `nats_flush[(::)]` — drain pipelined acks
+
+| Arg | Type | Description |
+|-----|------|-------------|
+| `(::)` | general null | Dummy argument (q requires at least 1 arg) |
+
+Awaits all ack futures queued by `nats_publish_async` in parallel. Blocks until every ack is confirmed (or fails). Prints a summary.
+
+**Must be called** after a `nats_publish_async` loop before process exit.
+
+```q
+nats_flush[(::)]
+/ [kdb-plugin] nats_flush | 1000 acks confirmed
+```
+
+---
+
+### `nats_subscribe[stream; subject; consumer; deliver_policy; callback]`
+
+| Arg | Type | Description |
+|-----|------|-------------|
+| `stream` | symbol | JetStream stream name, e.g. `` `TRADES `` |
+| `subject` | symbol | Subject filter, e.g. `` `trades.tick `` |
+| `consumer` | symbol | Durable consumer name (server-side), e.g. `` `my_consumer `` |
+| `deliver_policy` | symbol | `` `all ``, `` `last ``, `` `new ``, or `` `last_per_subject `` |
+| `callback` | symbol | q function name called per message, e.g. `` `on_trade `` |
+
+Attaches a durable pull consumer to the stream and spawns a background OS thread. **Returns immediately** — non-blocking for q.
+
+The callback receives the exact K type that was published (table, dict, atom, etc.). No manual deserialization needed.
+
+#### Deliver policies
+
+| Policy | Behaviour |
+|--------|-----------|
+| `` `all `` | Replay entire stream from the beginning |
+| `` `last `` | Start from the last message only |
+| `` `new `` | Only receive messages published after subscribing |
+| `` `last_per_subject `` | One message per unique subject (latest) |
+
+```q
+on_trade:{[t]
+    $[98h = type t;
+        `trades upsert t;
+      99h = type t;
+        `trades upsert enlist t;
+      -1 "Received: ",.Q.s t
+    ];
+    }
+
+nats_subscribe[`TRADES; `trades.tick; `my_consumer; `all; `on_trade]
+```
+
+**Requires:** `nats_connect`, `jetstream_init` (or stream pre-configured on server)
+
+---
+
+## Serialisation
+
+| Direction | Method | Detail |
+|-----------|--------|--------|
+| q → NATS | `q_ipc_encode(3)` | Encodes any K object as IPC binary bytes |
+| NATS → q | `q_ipc_decode()` | Decodes IPC bytes back to original K type |
+
+The subscriber always receives the **exact same K type** that was published. No type information is lost. This is the same binary format used by kdb+ IPC (`-8!` / `-9!`) but handled entirely in Rust via the kxkdb C API bindings.
+
+---
+
+## Subscriber Callback Mechanism
+
+The subscriber uses q's `sd1` event-loop registration (the "plumber pattern") to safely deliver messages from a background thread to q's main thread:
+
+```
+Background consumer thread              q main thread
+────────────────────────────             ─────────────
+NATS message arrives
+  pin_symbol()                       ←── register_callback(read_fd, handler)
+  q_ipc_decode(bytes) → K                watches read_fd via q event loop
+  unpin_symbol()
+  write(pipe_write_fd, &k_ptr, 8) ─────► nats_msg_handler(read_fd)
+                                          read(read_fd, &k_ptr, 8)
+                                          k(0, "callback", k_ptr, KNULL)
+                                          callback[decoded_K] fires in q
+```
+
+`pin_symbol()` / `unpin_symbol()` lock q's symbol intern table so symbols can be safely created from the background thread.
+
+---
+
+## Publish Mode Comparison
+
+| Mode | Function | JetStream | Ack | Blocking | Best for |
+|------|----------|-----------|-----|----------|----------|
+| Sync | `nats_publish` | Yes | Wait | Yes (1 RTT) | Guaranteed delivery |
+| Core | `nats_publish_core` | No | None | No | Maximum throughput, no persistence needed |
+| No-ack | `nats_publish_noack` | Yes | Drop | No | High throughput with server persistence |
+| Async | `nats_publish_async` | Yes | Batched | No (per-msg) | High throughput with batched confirmation |
+
+---
+
+## Dependencies
+
+```toml
+[dependencies]
+async-nats = "0.37"     # Async NATS client
+tokio = "1"              # Async runtime (full features)
+futures = "0.3"          # join_all for batched ack collection
+kxkdb = "0.1.0"          # kdb+ C API bindings (api feature)
+libc = "0.2"             # Unix pipe for sd1 callback mechanism
+```
+
+---
+
+## Project Structure
+
+```
+nats-rust-kdbx/
+├── Cargo.toml                # [lib] cdylib — produces libkdb_plugin.so
+├── Cargo.lock
+├── Dockerfile.rust           # Multi-stage build (rust:1.88-slim → ubuntu:22.04)
+├── nats-server.conf          # NATS JetStream server config (8MB max payload)
+├── src/
+│   └── lib.rs                # Plugin source — 9 FFI-exported functions
+└── examples/
+    ├── docker-compose.yml    # Minimal NATS JetStream stack
+    ├── publisher_sync.q      # JetStream sync ack publish
+    ├── publisher_noack.q     # Core NATS + JetStream no-ack publish
+    ├── publisher_async.q     # Pipelined ack publish with flush
+    └── subscriber.q          # JetStream durable pull subscriber
+```
+
+---
+
+## Notes
+
+- The NATS connection is established once per process and shared across all API calls
+- `nats_subscribe` can only be called once per process (single global callback and pipe)
+- The durable consumer persists its position on the NATS server — delete it with `nats consumer rm STREAM CONSUMER` to replay from the start
+- kdb+ symbols (`k.h` C API) are resolved at `dlopen` time — the Rust `.so` does not link against kdb+ at compile time
