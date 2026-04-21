@@ -23,6 +23,38 @@ A Rust shared library (`cdylib`) that embeds inside kdb+ via `2:` dynamic loadin
 
 Rust is loaded into q via `2:` (`dlopen`). There is no separate Rust process. The subscriber uses a background OS thread with a Unix pipe and q's `sd1` event-loop integration to deliver decoded messages back to q's main thread.
 
+### Rust-side IPC encode/decode
+
+Serialisation is performed entirely in Rust via the kxkdb C API (`q_ipc_encode` / `q_ipc_decode`), not in q with `-8!` / `-9!`. This is a deliberate design choice validated by benchmarking.
+
+The alternative — encoding in q with `-8!` before the FFI call, and decoding in q with `-9!` after receiving raw bytes — was tested across 12 benchmark configurations. It produced an average regression of **+25% p50**, **+19% p99**, and **+18% mean latency**, with the worst config showing +143% p99.
+
+The root cause is **lost pipelining**. With Rust-side decode on the consumer thread, decode of message N+1 runs in parallel with q's callback processing of message N:
+
+```
+Rust decodes (current — pipelined):
+  Consumer thread:  [decode N] [decode N+1] [decode N+2] ...
+  Main thread:      [callback N] [callback N+1] [callback N+2] ...
+                    ↑ overlapped — decode and callback run in parallel
+
+q decodes (rejected — serialised):
+  Consumer thread:  [wrap N] [wrap N+1] ...  ← almost instant, idles
+  Main thread:      [decode+callback N] [decode+callback N+1] ...
+                    ↑ serial — no overlap
+```
+
+The Rust approach requires `pin_symbol()` / `unpin_symbol()` to safely intern kdb+ symbols from the background thread, but the ~20% latency improvement justifies the added complexity.
+
+### Subscriber: dedicated tokio runtime vs spawn_blocking
+
+The subscriber's consumer thread creates its own `current_thread` tokio runtime rather than using `spawn_blocking` on the shared publisher runtime. Three reasons:
+
+1. **No nested `block_on`** — the publisher APIs (`nats_publish`, etc.) call `rt().block_on()` from q's main thread. If the subscriber shared this runtime via `spawn_blocking`, any async work inside that closure would need its own `block_on`, which panics inside an existing tokio context. A separate `current_thread` runtime avoids this entirely.
+
+2. **K pointer safety** — raw K pointers from `q_ipc_decode` are not `Send`. A `current_thread` runtime guarantees the future runs on a single OS thread with no task migration across `.await` points. A multi-threaded runtime could move the task to a different worker thread after an `.await`, invalidating the raw pointer.
+
+3. **Isolation** — the subscriber loop runs indefinitely. On a shared runtime, a blocked or slow consumer could starve the publisher's short-lived `block_on` calls. A dedicated runtime keeps publisher and subscriber workloads independent.
+
 ---
 
 ## Build
@@ -65,6 +97,7 @@ volumes:
 ```bash
 # Start NATS JetStream
 cd examples
+mkdir -p nats-data
 docker compose up -d
 
 # Terminal 1 — subscriber (start first)
