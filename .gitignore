@@ -1,0 +1,4 @@
+target/
+nats-data/
+examples/nats-data/
+*.so

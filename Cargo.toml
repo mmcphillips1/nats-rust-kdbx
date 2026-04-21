@@ -1,0 +1,17 @@
+[package]
+name = "nats-kdb-proto"
+version = "0.1.0"
+edition = "2021"
+
+# cdylib: the Rust shared library q loads with 2:
+# produces target/debug/libkdb_plugin.so on Linux
+[lib]
+name = "kdb_plugin"
+crate-type = ["cdylib"]
+
+[dependencies]
+async-nats = "0.37"
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+kxkdb = { version = "0.1.0", features = ["api"] }
+libc  = "0.2"

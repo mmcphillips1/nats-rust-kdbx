@@ -1,0 +1,17 @@
+services:
+  nats:
+    image: nats:alpine
+    user: "${UID:-1000}:${GID:-1000}"
+    command: ["-c", "/etc/nats/nats-server.conf"]
+    ports:
+      - "4222:4222"   # Client connections
+      - "8222:8222"   # HTTP monitoring
+    volumes:
+      - ./nats-data:/data
+      - ../nats-server.conf:/etc/nats/nats-server.conf:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 2s

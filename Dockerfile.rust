@@ -1,0 +1,30 @@
+# ─── Stage 1: Build Rust cdylib ──────────────────────────────────────────────
+FROM rust:1.88-slim AS builder
+
+RUN apt-get update && apt-get install -y pkg-config libssl-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY Cargo.toml ./
+COPY src ./src
+
+# Build only the shared library (cdylib); standalone binaries not needed here
+RUN cargo build --lib --release
+
+# ─── Stage 2: Runtime ────────────────────────────────────────────────────────
+FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y libssl3 && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Plugin .so — kdb+ symbols (k, kj, kf, …) resolved at dlopen time from q
+COPY --from=builder /build/target/release/libkdb_plugin.so \
+                    ./target/release/libkdb_plugin.so
+
+# kdb+ is not redistributable.
+# Mount your q installation via docker-compose:
+#   volumes:
+#     - ${QHOME}:/q:ro
+# Then /q/l64/q is the q binary inside the container.
