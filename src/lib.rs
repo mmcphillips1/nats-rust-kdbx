@@ -44,9 +44,11 @@
 ///      event loop via register_callback (wraps sd1).
 ///   2. A background OS thread runs a dedicated current_thread tokio runtime,
 ///      pulling messages from NATS.
-///   3. Each byte-list K pointer is written (8 bytes) to the pipe write end.
+///   3. Each PendingMsg (decoded K + NATS Message) is boxed and its pointer
+///      written (8 bytes) to the pipe write end.
 ///   4. q's event loop calls nats_msg_handler on q's own main thread, which
-///      reads the pointer and invokes callback[bytes_K].
+///      reads the pointer, invokes callback[decoded_K], and acks the NATS
+///      message only if the callback succeeds (at-least-once delivery).
 
 use async_nats::jetstream::{self, consumer::{pull, DeliverPolicy}, stream};
 use futures::future::join_all;
@@ -57,6 +59,13 @@ use kxkdb::qtype;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 use tokio::runtime::Runtime;
+
+/// Bundles a decoded K value with its NATS message handle so the ack can be
+/// deferred until after the q callback succeeds.
+struct PendingMsg {
+    decoded_k: K,
+    msg: async_nats::jetstream::message::Message,
+}
 
 // ── Globals ───────────────────────────────────────────────────────────────────
 
@@ -95,25 +104,29 @@ fn nats_client() -> &'static async_nats::Client {
 // ── Pipe callback — runs on q's main thread via q's event loop ────────────────
 
 extern "C" fn nats_msg_handler(pipe_read_fd: I) -> K {
-    // Read the 8-byte K pointer written by the consumer thread.
-    let mut k_ptr: K = KNULL;
+    // Read the 8-byte PendingMsg pointer written by the consumer thread.
+    let mut ptr: *mut PendingMsg = std::ptr::null_mut();
     unsafe {
         libc::read(
             pipe_read_fd,
-            std::mem::transmute::<*mut K, *mut libc::c_void>(&mut k_ptr),
-            std::mem::size_of::<K>(),
-        )
-    };
+            &mut ptr as *mut *mut PendingMsg as *mut libc::c_void,
+            std::mem::size_of::<*mut PendingMsg>(),
+        );
+    }
 
-    if k_ptr == KNULL {
+    if ptr.is_null() {
         return KNULL;
     }
 
-    // Invoke the registered q callback: callback_fn[bytes_K]
+    let pending = unsafe { Box::from_raw(ptr) };
+
+    // Invoke the registered q callback: callback_fn[decoded_K]
     let cb = CALLBACK
         .get()
         .expect("[kdb-plugin] nats_msg_handler: no callback registered");
-    let result = error_to_string(unsafe { native::k(0, cb.as_ptr() as S, k_ptr, KNULL) });
+    let result = error_to_string(unsafe {
+        native::k(0, cb.as_ptr() as S, pending.decoded_k, KNULL)
+    });
 
     if result.get_type() == qtype::ERROR {
         eprintln!(
@@ -121,10 +134,17 @@ extern "C" fn nats_msg_handler(pipe_read_fd: I) -> K {
             result.get_error_string().unwrap_or("unknown")
         );
         decrement_reference_count(result);
+        // Don't ack — message will be redelivered after ack_wait timeout
         return KNULL;
     }
 
     decrement_reference_count(result);
+
+    // Callback succeeded — ack the message
+    if let Err(e) = rt().block_on(pending.msg.ack()) {
+        eprintln!("[kdb-plugin] ack error: {}", e);
+    }
+
     KNULL
 }
 
@@ -510,8 +530,8 @@ pub extern "C" fn nats_subscribe(stream_name: K, subject: K, consumer_name: K, d
 
             while let Some(msg) = messages.next().await {
                 let msg     = msg.unwrap();
-                let payload = msg.payload.to_vec(); // Vec<u8>: Send — safe across .await
-                msg.ack().await.unwrap();
+                let payload = msg.payload.to_vec();
+                // Ack deferred — handled by nats_msg_handler after q callback
 
                 // Decode kdb+ IPC binary → K.
                 // pin_symbol locks q's symbol intern table so symbols can be
@@ -525,17 +545,18 @@ pub extern "C" fn nats_subscribe(stream_name: K, subject: K, consumer_name: K, d
                 decrement_reference_count(byte_k);
 
                 match decode_result {
-                    Ok(mut decoded_k) => {
+                    Ok(decoded_k) => {
                         unpin_symbol();
-                        // Write the K pointer to the pipe (8 bytes).
+                        // Box the decoded K with the NATS message for deferred ack.
+                        // Write the pointer to the pipe (8 bytes).
                         // q's event loop detects this and calls nats_msg_handler.
+                        let pending = Box::new(PendingMsg { decoded_k, msg });
+                        let ptr = Box::into_raw(pending);
                         unsafe {
                             libc::write(
                                 write_fd,
-                                std::mem::transmute::<*mut K, *mut libc::c_void>(
-                                    &mut decoded_k,
-                                ),
-                                std::mem::size_of::<K>(),
+                                &ptr as *const *mut PendingMsg as *const libc::c_void,
+                                std::mem::size_of::<*mut PendingMsg>(),
                             );
                         }
                     }
