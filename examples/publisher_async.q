@@ -1,19 +1,18 @@
 / publisher_async.q — Pipelined JetStream publish with batched ack collection
-/
+
 / Demonstrates: nats_publish_async, nats_flush, nats_set_flush_size
-/
+
 / nats_publish_async queues the server ack future without waiting.
 / Call nats_flush[(::)] after the publish loop to await all acks in parallel.
 / Optionally set nats_set_flush_size[N] to auto-flush every N messages.
 
 / ── Load plugin ──────────────────────────────────────────────────────────────
-PLUGIN: `$getenv[`PLUGIN_PATH],"/libkdb_plugin"
-if[PLUGIN~`;PLUGIN:`:/app/target/release/libkdb_plugin];
+PLUGIN: `$$[""~p:getenv`PLUGIN_PATH; "target/release"; p],"/libkdb_plugin"
 
 nats_connect:        PLUGIN 2: (`nats_connect;        2)
 jetstream_init:      PLUGIN 2: (`jetstream_init;      2)
 nats_publish_async:  PLUGIN 2: (`nats_publish_async;  2)
-nats_flush:          PLUGIN 2: (`nats_flush;           1)
+nats_flush:          PLUGIN 2: (`nats_flush;          1)
 nats_set_flush_size: PLUGIN 2: (`nats_set_flush_size; 1)
 
 / ── Connect & create stream ──────────────────────────────────────────────────

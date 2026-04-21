@@ -1,16 +1,15 @@
 / publisher_noack.q — Fire-and-forget publishing
-/
+
 / Demonstrates two no-ack publish modes:
 /   nats_publish_core  — core NATS (no JetStream). Fastest, no persistence guarantee.
 /   nats_publish_noack — JetStream publish, but drops the ack future immediately.
 /                        Message IS persisted by the server; publisher just doesn't wait.
-/
+
 / Both return immediately without blocking. Choose based on whether you need
 / server-side persistence (noack) or pure speed with no JetStream overhead (core).
 
 / ── Load plugin ──────────────────────────────────────────────────────────────
-PLUGIN: `$getenv[`PLUGIN_PATH],"/libkdb_plugin"
-if[PLUGIN~`;PLUGIN:`:/app/target/release/libkdb_plugin];
+PLUGIN: `$$[""~p:getenv`PLUGIN_PATH; "target/release"; p],"/libkdb_plugin"
 
 nats_connect:       PLUGIN 2: (`nats_connect;       2)
 jetstream_init:     PLUGIN 2: (`jetstream_init;     2)

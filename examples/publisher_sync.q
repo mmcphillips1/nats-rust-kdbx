@@ -1,12 +1,11 @@
 / publisher_sync.q — JetStream publish with server acknowledgment
-/
+
 / Demonstrates: nats_connect, jetstream_init, nats_publish
 / Each message blocks until the server confirms persistence (one round-trip).
 / Safest option — guarantees every message is stored before returning.
 
 / ── Load plugin ──────────────────────────────────────────────────────────────
-PLUGIN: `$getenv[`PLUGIN_PATH],"/libkdb_plugin"
-if[PLUGIN~`;PLUGIN:`:/app/target/release/libkdb_plugin];
+PLUGIN: `$$[""~p:getenv`PLUGIN_PATH; "target/release"; p],"/libkdb_plugin"
 
 nats_connect:   PLUGIN 2: (`nats_connect;   2)
 jetstream_init: PLUGIN 2: (`jetstream_init; 2)

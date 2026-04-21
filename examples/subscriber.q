@@ -1,12 +1,11 @@
 / subscriber.q — JetStream durable pull subscriber
-/
+
 / Demonstrates: nats_connect, jetstream_init, nats_subscribe
 / The subscriber runs a background consumer thread; the callback fires on q's
 / main thread via the sd1/pipe event-loop mechanism.
 
 / ── Load plugin ──────────────────────────────────────────────────────────────
-PLUGIN: `$getenv[`PLUGIN_PATH],"/libkdb_plugin"
-if[PLUGIN~`;PLUGIN:`:/app/target/release/libkdb_plugin];
+PLUGIN: `$$[""~p:getenv`PLUGIN_PATH; "target/release"; p],"/libkdb_plugin"
 
 nats_connect:   PLUGIN 2: (`nats_connect;   2)
 jetstream_init: PLUGIN 2: (`jetstream_init; 2)

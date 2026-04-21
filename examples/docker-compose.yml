@@ -1,6 +1,7 @@
 services:
   nats:
     image: nats:alpine
+    user: "${UID:-1000}:${GID:-1000}"
     command: ["-c", "/etc/nats/nats-server.conf"]
     ports:
       - "4222:4222"   # Client connections
@@ -14,31 +15,3 @@ services:
       timeout: 2s
       retries: 10
       start_period: 2s
-
-  # One-shot: creates the JetStream stream before publishers/subscribers start.
-  stream-init:
-    image: natsio/nats-box:latest
-    depends_on:
-      nats:
-        condition: service_healthy
-    command:
-      - sh
-      - -c
-      - |
-        nats -s nats://nats:4222 stream add TRADES \
-          --subjects=trades.tick --storage=memory \
-          --retention=limits --discard=old 2>/dev/null || true
-        echo "stream-init: TRADES stream ready"
-    restart: "no"
-
-  # Example: build the plugin image for use in publisher/subscriber containers
-  # Uncomment and adjust QHOME path to your kdb+ installation.
-  #
-  # plugin:
-  #   build:
-  #     context: ..
-  #     dockerfile: Dockerfile.rust
-  #   volumes:
-  #     - ${QHOME:-~/.kx}:/q:ro
-  #     - ./:/app/examples:ro
-  #   command: ["/q/l64/q", "examples/publisher_sync.q"]
